@@ -1,207 +1,87 @@
-# Terraform AWS KMS module 
+The Terraform module is used by the ITGix AWS Landing Zone - https://itgix.com/itgix-landing-zone/
 
-This module creates **many KMS keys** per region using a single module call (`keys = { ... }`).
+# AWS KMS Terraform Module
 
-## Goals
-- **AWS-style default**: by default, the key policy enables IAM policies in the account to grant key usage
-- **Easy restriction**: optionally restrict usage to explicit IAM principals and/or AWS services
-- **Diff-safe**: uses `aws_kms_key_policy` (separate resource) instead of inline key policy
-- **Multi-Region primary keys** supported (`multi_region = true`) — replicas are created outside the module using provider aliases
-- **Origin selector** for different key types (AWS-managed, imported key material, Custom Key Store)
+This module creates and manages AWS KMS keys with support for symmetric, asymmetric, HMAC, and external key material. Includes configurable key policies, aliases, rotation, and access controls.
 
----
+Part of the [ITGix AWS Landing Zone](https://itgix.com/itgix-landing-zone/).
 
-## Key origins
+## Resources Created
 
-Per-key, choose the origin mode:
+- KMS keys (symmetric, asymmetric, HMAC, or external)
+- KMS aliases (primary and extra)
+- Key policies with administrator and user access
+- Service-scoped grants
 
-```hcl
-origin = "AWS_KMS"      # default (AWS generates key material)
-origin = "EXTERNAL"     # imported key material (BYOK) via aws_kms_external_key
-origin = "AWS_CLOUDHSM" # Custom Key Store key (requires custom_key_store_id)
-```
+## Requirements
 
-### EXTERNAL notes
+| Name | Version |
+|------|---------|
+| Terraform | >= 1.5.0 |
+| AWS provider | >= 5.50 |
 
-If you set `origin = "EXTERNAL"` you can optionally pass `key_material_base64`.
-If you **don't** pass key material, the key is created in **PendingImport** and the module will keep it **disabled**.
+## Inputs
 
-### AWS_CLOUDHSM notes
+| Name | Description | Type | Default | Required |
+|------|-------------|------|---------|----------|
+| `tags` | Tags applied to all resources (merged with per-key tags) | `map(string)` | `{}` | no |
+| `enable_automatic_rotation` | Global toggle for KMS automatic rotation | `bool` | `true` | no |
+| `enable_same_account_read_only` | Allow same-account read-only access to keys | `bool` | `false` | no |
+| `keys` | Map of KMS keys to create (see below for object schema) | `map(object({...}))` | `{}` | no |
 
-If you set `custom_key_store_id`, the module treats the key as `AWS_CLOUDHSM` automatically.
-Custom Key Store keys are limited to symmetric encryption keys and do not support multi-region or automatic rotation.
+The `keys` object supports:
 
----
+| Attribute | Description | Type | Default |
+|-----------|-------------|------|---------|
+| `description` | Key description | `string` | — (required) |
+| `preset` | Key preset: `symmetric`, `asymmetric_sign`, `hmac`, `custom` | `string` | `"symmetric"` |
+| `key_usage` | Key usage (required when preset = custom) | `string` | `null` |
+| `key_spec` | Key spec (required when preset = custom) | `string` | `null` |
+| `origin` | Key origin: `AWS_KMS`, `EXTERNAL`, `AWS_CLOUDHSM` | `string` | `"AWS_KMS"` |
+| `custom_key_store_id` | Custom key store ID (for AWS_CLOUDHSM) | `string` | `null` |
+| `key_material_base64` | Base64-encoded key material (EXTERNAL only) | `string` | `null` |
+| `multi_region` | Enable multi-region key | `bool` | `false` |
+| `enable_key_rotation` | Enable key rotation | `bool` | `true` |
+| `rotation_period_in_days` | Rotation period in days | `number` | `365` |
+| `deletion_window_in_days` | Deletion window in days | `number` | `30` |
+| `is_enabled` | Whether the key is enabled | `bool` | `true` |
+| `primary_alias` | Primary alias (without `alias/` prefix) | `string` | — (required) |
+| `extra_aliases` | Additional aliases | `list(string)` | `[]` |
+| `kms_key_administrators` | IAM ARNs for key administrators | `list(string)` | `[]` |
+| `kms_key_users` | IAM ARNs for key users | `list(string)` | `[]` |
+| `allowed_via_services` | AWS service names allowed to use the key | `list(string)` | `[]` |
+| `policy_json` | Custom key policy JSON (escape hatch) | `string` | `null` |
+| `tags` | Per-key tags | `map(string)` | `{}` |
 
-## Policy behavior (important)
+## Outputs
 
-### Default (AWS-style, account-wide IAM permissions)
-If you do **not** set `kms_key_users` and do **not** set `allowed_via_services`, the module adds
-a statement allowing usage by principals in the same account when permitted by IAM policies.
+| Name | Description |
+|------|-------------|
+| `keys` | Map of created keys with key_id, arn, multi_region, enabled, primary_alias, and extra_aliases |
 
-### Restricted to explicit IAM principals
-Set:
-```hcl
-kms_key_administrators = [aws_iam_role.platform_deployer.arn]
-kms_key_users          = [aws_iam_role.platform_deployer.arn]
-```
-
-### Service-scoped key
-Set:
-```hcl
-allowed_via_services = ["s3"]            # S3-only
-allowed_via_services = ["ec2"]           # EBS/EC2-only
-allowed_via_services = ["logs"]          # CloudWatch Logs-only
-allowed_via_services = ["secretsmanager"]# Secrets Manager-only
-allowed_via_services = ["codepipeline","codebuild","s3"] # artifacts/pipeline common set
-```
-
-The module enforces service scope using:
-- `kms:CallerAccount`
-- `kms:ViaService = <service>.<region>.amazonaws.com`
-
----
-
-## Automatic rotation
-
-You can globally enable/disable KMS automatic rotation:
+## Usage Example
 
 ```hcl
-enable_automatic_rotation = true  # default
-```
-
-Per-key, you still control rotation with `enable_key_rotation`.
-
-If rotation is enabled, you can set `rotation_period_in_days` (90..2560). Default is 365.
-
-
-## Usage
-### Basic example
-```hcl
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 6.00"
-    }
-  }
-}
-provider "aws" {
-  region = "eu-central-1"
-}
-
 module "kms" {
-  # enable_automatic_rotation = true
-  source = "../../"
-  keys = {
-    general = {
-      description   = "General purpose key"
-      primary_alias = "general"
-    }
-    restricted = {
-      description            = "Restricted key"
-      primary_alias          = "restricted"
-      kms_key_administrators = ["arn:aws:iam::123456789012:role/platform-deployer"]
-      kms_key_users          = ["arn:aws:iam::123456789012:role/platform-deployer"]
-    }
-  }
-}
-output "keys" { value = module.kms.keys }
+  source = "path/to/tf-module-aws-kms"
 
-```
-### Multi region primary and replica
-```hcl
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 6.00"
-    }
-  }
-}
-provider "aws" {
-  region = "eu-central-1"
-}
-
-provider "aws" {
-  alias  = "eu_west_1"
-  region = "eu-west-1"
-}
-
-module "kms_primary" {
-  source = "../../"
-  keys = {
-    mr = {
-      description          = "Multi-Region PRIMARY key"
-      primary_alias        = "mr-key"
-      multi_region         = true
-      allowed_via_services = ["s3"]
-    }
-  }
-}
-
-resource "aws_kms_replica_key" "eu_west_1" {
-  provider        = aws.eu_west_1
-  primary_key_arn = module.kms_primary.keys["mr"].arn
-  description     = "Replica in eu-west-1"
-}
-
-resource "aws_kms_alias" "eu_west_1_alias" {
-  provider      = aws.eu_west_1
-  name          = "alias/mr-key"
-  target_key_id = aws_kms_replica_key.eu_west_1.key_id
-}
-
-output "primary" { value = module.kms_primary.keys["mr"] }
-output "replica_key_id" { value = aws_kms_replica_key.eu_west_1.key_id }
-```
-
-### Service scoped
-```hcl
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 6.00"
-    }
-  }
-}
-provider "aws" {
-  region = "eu-central-1"
-}
-
-module "kms" {
-  source = "../../"
   keys = {
     s3 = {
-      description          = "S3-only key"
-      primary_alias        = "s3-key"
+      description   = "KMS key for S3 encryption"
+      primary_alias = "my-s3-key"
       allowed_via_services = ["s3"]
+      kms_key_administrators = ["arn:aws:iam::123456789012:role/admin"]
     }
     ebs = {
-      description          = "EBS/EC2-only key"
-      primary_alias        = "ebs-key"
+      description   = "KMS key for EBS volumes"
+      primary_alias = "my-ebs-key"
       allowed_via_services = ["ec2"]
     }
-    logs = {
-      description          = "Logs-only key"
-      primary_alias        = "logs-key"
-      allowed_via_services = ["logs"]
-    }
-    secrets = {
-      description          = "Secrets-only key"
-      primary_alias        = "secrets-key"
-      allowed_via_services = ["secretsmanager"]
-    }
-    artifacts = {
-      description          = "Artifacts/pipeline key"
-      primary_alias        = "artifacts-key"
-      allowed_via_services = ["s3", "codepipeline", "codebuild"]
-    }
+  }
+
+  tags = {
+    Environment = "production"
+    ManagedBy   = "terraform"
   }
 }
-output "keys" { value = module.kms.keys }
 ```
